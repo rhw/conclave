@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conclave"
+version = "0.0.1"
+description = "conclave — LSST-DESC PZ Data Challenge TS1 ensemble (PZFlow+GPz+FlexZBoost, convex-QP weights, global-PIT)"
+requires-python = ">=3.13"
+dependencies = ["numpy", "scipy", "pandas", "pyarrow", "tables_io", "qp-prob",
+                "pz-rail-base", "pz-rail-flexzboost", "pz-rail-pzflow", "pz-rail-gpz-v1"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+conclave = ["catalogs/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slurm: heavy RAIL estimator tests; run on Sherlock Slurm only (login-node SIGKILL)"]
