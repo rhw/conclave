@@ -3,23 +3,46 @@ import numpy as np
 import qp
 from rail.core import DataStore
 from rail.core.data import TableHandle
-from rail.estimation.algos.bpz_lite import BPZliteInformer, BPZliteEstimator
-from rail.estimation.algos.cmnn import CMNNInformer, CMNNEstimator
-from rail.estimation.algos.dnf import DNFInformer, DNFEstimator
-# DNFEstimator.__init__ calls self.log.info(...) before RailStage provides a `.log` attribute
-# (rail dnf.py:171 -> AttributeError: 'DNFEstimator' has no attribute 'log'). Shim a module
-# logger onto the classes so DNF (the dnf_lsst/dnf_roman reference submissions) is runnable.
-import logging as _logging
-for _dnf_cls in (DNFInformer, DNFEstimator):
-    if not isinstance(getattr(_dnf_cls, "log", None), _logging.Logger):
-        _dnf_cls.log = _logging.getLogger(_dnf_cls.__name__)
+# Required estimators: the winner trio (flexzboost/gpz/pzflow) + trainz (in pz-rail-base).
 from rail.estimation.algos.flexzboost import FlexZBoostInformer, FlexZBoostEstimator
 from rail.estimation.algos.gpz import GPzInformer, GPzEstimator
-from rail.estimation.algos.k_nearneigh import KNearNeighInformer, KNearNeighEstimator
 from rail.estimation.algos.pzflow_nf import PZFlowInformer, PZFlowEstimator
-from rail.estimation.algos.random_forest import RandomForestInformer, RandomForestClassifier
 from rail.estimation.algos.train_z import TrainZInformer, TrainZEstimator
-from rail.estimation.algos.tpz_lite import TPZliteInformer, TPZliteEstimator
+
+# Optional roster estimators, used only by the full factorial harness (not the TS1 winner).
+# conclave's required deps are just the four above; import the rest if their RAIL packages are
+# installed, else leave the class names None so conclave.submission imports and runs without them
+# (calling an unavailable estimator's train_*/estimate_* then fails clearly at call time).
+import logging as _logging
+try:
+    from rail.estimation.algos.bpz_lite import BPZliteInformer, BPZliteEstimator
+except ImportError:
+    BPZliteInformer = BPZliteEstimator = None
+try:
+    from rail.estimation.algos.cmnn import CMNNInformer, CMNNEstimator
+except ImportError:
+    CMNNInformer = CMNNEstimator = None
+try:
+    from rail.estimation.algos.dnf import DNFInformer, DNFEstimator
+    # DNFEstimator.__init__ calls self.log.info(...) before RailStage provides a `.log` attribute
+    # (rail dnf.py:171). Shim a module logger onto the classes so DNF is runnable.
+    for _dnf_cls in (DNFInformer, DNFEstimator):
+        if not isinstance(getattr(_dnf_cls, "log", None), _logging.Logger):
+            _dnf_cls.log = _logging.getLogger(_dnf_cls.__name__)
+except ImportError:
+    DNFInformer = DNFEstimator = None
+try:
+    from rail.estimation.algos.k_nearneigh import KNearNeighInformer, KNearNeighEstimator
+except ImportError:
+    KNearNeighInformer = KNearNeighEstimator = None
+try:
+    from rail.estimation.algos.random_forest import RandomForestInformer, RandomForestClassifier
+except ImportError:
+    RandomForestInformer = RandomForestClassifier = None
+try:
+    from rail.estimation.algos.tpz_lite import TPZliteInformer, TPZliteEstimator
+except ImportError:
+    TPZliteInformer = TPZliteEstimator = None
 from conclave import bands
 
 # Number of training epochs for PZFlow normalizing-flow training (PZFlow's default ~30
