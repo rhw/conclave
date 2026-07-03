@@ -365,18 +365,32 @@ def estimate_pzflow(model_handle, data_dict, band_set: str, name: str):
         n_obj = len(np.asarray(est_dict[cols[0]]))
         est_dict = dict(est_dict)
         est_dict["redshift"] = np.zeros(n_obj, dtype=float)
-    handle = make_handle(f"{name}_data", est_dict)
-    est = PZFlowEstimator.make_stage(
-        name=name, output_mode="return", model=model_handle,
-        column_names=cols, hdf5_groupname="",
-        zmin=PZFLOW_ZMIN, zmax=PZFLOW_ZMAX, nzbins=PZFLOW_NZBINS,
-        # Chunk the flow evaluation: PZFlow's JAX log-prob over the z-grid for the full
-        # test set in one shot peaks at ~20+ GB (fine on a 48 GB node, OOMs a 16 GB CI
-        # runner). Chunking batches the identical computation to cap peak memory.
-        chunk_size=2000,
-    )
-    out = est.estimate(handle)
-    return _finalize_ensemble(out.data, data_dict, band_set)
+    zgrid = np.linspace(PZFLOW_ZMIN, PZFLOW_ZMAX, PZFLOW_NZBINS)
+
+    def _run(sub_dict, sub_name):
+        est = PZFlowEstimator.make_stage(
+            name=sub_name, output_mode="return", model=model_handle,
+            column_names=cols, hdf5_groupname="",
+            zmin=PZFLOW_ZMIN, zmax=PZFLOW_ZMAX, nzbins=PZFLOW_NZBINS,
+        )
+        out = est.estimate(make_handle(f"{sub_name}_data", sub_dict))
+        return np.asarray(out.data.pdf(zgrid))          # (n_sub, nzbins)
+
+    # PZFlow's error-sampled posterior (Monte-Carlo over photometry errors) for the full test
+    # set peaks ~23 GB in one JAX allocation — fine on a 48 GB node, OOMs a 16 GB CI runner. RAIL
+    # only chunks *file* input, not the in-memory handle we pass, so batch the objects ourselves
+    # and stitch the per-object PDFs back together (identical result, capped peak memory).
+    n = len(np.asarray(est_dict[cols[0]]))
+    _BATCH = 2000
+    if n <= _BATCH:
+        yvals = _run(est_dict, name)
+    else:
+        parts = [_run({k: np.asarray(v)[i:i + _BATCH] for k, v in est_dict.items()},
+                      f"{name}_b{i}")
+                 for i in range(0, n, _BATCH)]
+        yvals = np.concatenate(parts, axis=0)
+    ens = qp.Ensemble(qp.interp, data=dict(xvals=zgrid, yvals=yvals))
+    return _finalize_ensemble(ens, data_dict, band_set)
 
 
 # ---------------------------------------------------------------------------
