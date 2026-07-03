@@ -370,6 +370,10 @@ def estimate_pzflow(model_handle, data_dict, band_set: str, name: str):
         name=name, output_mode="return", model=model_handle,
         column_names=cols, hdf5_groupname="",
         zmin=PZFLOW_ZMIN, zmax=PZFLOW_ZMAX, nzbins=PZFLOW_NZBINS,
+        # Chunk the flow evaluation: PZFlow's JAX log-prob over the z-grid for the full
+        # test set in one shot peaks at ~20+ GB (fine on a 48 GB node, OOMs a 16 GB CI
+        # runner). Chunking batches the identical computation to cap peak memory.
+        chunk_size=2000,
     )
     out = est.estimate(handle)
     return _finalize_ensemble(out.data, data_dict, band_set)
