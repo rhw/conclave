@@ -1,13 +1,32 @@
-"""Config-agnostic TS1 submission entry points wrapping the pzdc harness.
+"""Config-agnostic submission entry points wrapping the pzdc harness.
 
-Exposes the two upstream functions
+Exposes the upstream functions
     run_taskset_1_training_and_estimation(train_file, test_file, output_file, config=DEFAULT_CONFIG)
     run_taskset_1_estimation_only(model_file, test_file, output_file, config=DEFAULT_CONFIG)
+    run_taskset_2_training_and_estimation(train_file, test_file, output_file, config=TS2_CONFIG)
+    run_taskset_2_estimation_only(model_file, test_file, output_file, config=TS2_CONFIG)
 plus a (train_submission_model, infer) pair for the pretrained-model deliverable.
 
 DEFAULT_CONFIG is the winning combination locked by the Phase-3 ensemble
 experiment: PZFlow + GPz + FlexZBoost on lsst_roman, convex-QP optimal weights,
 global-PIT recalibration.
+
+TS2_CONFIG swaps in the support-deficit-binned PIT recalibrator, settled by the
+depth-matched rehearsal (job 33575936): train on ALL provided training objects
+(importance weighting demonstrably hurts at depth) + per-deficit-bin PIT remap,
+where the deficit is the label-free color-space kNN support deficit of
+challenge.label_free_deficit. Because the blind test file arrives without the
+training photometry, the model bundle carries a frozen ``deficit_ref`` (the
+train-slice band columns); infer rebuilds a merged catalog (reference + test)
+and calls the same label_free_deficit, so train- and test-time deficits share
+one code path. The deliverable partition is stratified_split(CALIB_FRAC=0.2,
+seed=0) on the training file — stratified on REDSHIFT, whereas the evidence
+arms' calib slices were stratified on I-MAG (challenge.ts2_submission_splits) —
+a known, deliberate recipe difference (red-team M2): the TS1-validated
+partition is retained, and the rehearsal winner was selected under the harsher
+bright-only-calib deployment condition. Test objects out of training support
+digitize into the positive-deficit tail bins and receive their remaps — by
+design, not an error path.
 
 No-leakage recipe (the blind 20k test file has no redshift):
   - train_submission_model splits a calibration slice off the *training* file;
@@ -43,6 +62,54 @@ DEFAULT_CONFIG = Config(members=["pzflow", "gpz", "flexzboost"],
                         band_set="lsst_roman",
                         weights="optimal",
                         recal="global_pit")
+
+# TS2: same ensemble, support-deficit-binned recalibration. Settled by the
+# depth-matched rehearsal (job 33575936, journal 2026-07-11-depth-rehearsal):
+# deficitbinned_pit beats the previously packaged magbinned_pit in 36/36
+# paired per-seed deployment-condition comparisons and wins 5/7 scored
+# metrics vs global_pit on both blind-test i-mag mixes (pre-registered rule).
+TS2_CONFIG = Config(members=["pzflow", "gpz", "flexzboost"],
+                    band_set="lsst_roman",
+                    weights="optimal",
+                    recal="deficitbinned_pit")
+
+
+def _feat_ancil(cat, band_set):
+    """feat_<band> ancil columns (same naming as ts2.run_eval) so feature-conditional
+    recalibrators (magbinned_pit) can fit/apply; ignored by global_pit. Only columns
+    present in the catalog are attached — a recal needing an absent feature fails
+    with a clear KeyError at its own fit/apply, not here."""
+    from conclave import bands
+    return {f"feat_{c}": np.asarray(cat[c])
+            for c in bands.band_columns(band_set) if c in cat}
+
+
+def _deficit_ref(cat, band_set):
+    """Frozen labeled-set photometry (band columns only) stored in the model
+    bundle so infer can compute the label-free support deficit of blind test
+    objects long after the training file is gone."""
+    from conclave import bands
+    return {c: np.asarray(cat[c], dtype=float) for c in bands.band_columns(band_set)}
+
+
+def _deficit_from_ref(ref, target_cat, band_set):
+    """feat_deficit for target objects against the FROZEN labeled reference.
+
+    Concatenates the stored labeled band columns with the target's and calls
+    challenge.label_free_deficit on the merged catalog, so train- and
+    test-time deficits share one code path (identical labeled-set
+    standardization, NaN imputation, and d_ref by construction — a target's
+    deficit depends only on its own photometry and the frozen reference)."""
+    from conclave import bands, challenge
+    cols = bands.band_columns(band_set)
+    n_lab = len(np.asarray(ref[cols[0]]))
+    n_tgt = len(np.asarray(target_cat[cols[0]]))
+    merged = {c: np.concatenate([np.asarray(ref[c], dtype=float),
+                                 np.asarray(target_cat[c], dtype=float)])
+              for c in cols}
+    return challenge.label_free_deficit(
+        merged, labeled_idx=np.arange(n_lab),
+        target_idx=np.arange(n_lab, n_lab + n_tgt), band_set=band_set)
 
 
 def _combine(ens_list, weights):
@@ -132,7 +199,16 @@ def train_submission_model(train_file, config=DEFAULT_CONFIG):
         raise ValueError(f"unknown weights spec: {config.weights!r}")
     w = np.asarray(w, dtype=float)
 
-    combined_ca = ensemble.combine(stacked_ca, w)
+    # feat ancil is required by feature-conditional recals (magbinned_pit) and
+    # inert for global_pit (whose fit reads only PDFs + truth). Deficit recals
+    # additionally need feat_deficit (labeled set = the train slice, matching
+    # ts2.run_eval's labeled_idx=mtr_idx) and a frozen reference for infer.
+    feat_ca = _feat_ancil(ca, config.band_set)
+    deficit_ref = None
+    if config.recal in recal_mod.DEFICIT_RECALS:
+        deficit_ref = _deficit_ref(tr, config.band_set)
+        feat_ca["feat_deficit"] = _deficit_from_ref(deficit_ref, ca, config.band_set)
+    combined_ca = ensemble.combine(stacked_ca, w, ancil=feat_ca)
 
     # Fit the recalibrator on the combined calib ensemble vs calib truth.
     r = recal_mod.RECALIBRATORS[config.recal]()
@@ -140,7 +216,8 @@ def train_submission_model(train_file, config=DEFAULT_CONFIG):
     # Clear the leakage guard: the test ensemble is a different object/rows.
     r._fit_idx = set()
 
-    return {"models": models, "weights": w, "recal": r, "config": config}
+    return {"models": models, "weights": w, "recal": r, "config": config,
+            "deficit_ref": deficit_ref}
 
 
 def infer(model_bundle, test_file):
@@ -160,7 +237,16 @@ def infer(model_bundle, test_file):
         member_ens.append(est_fn(model_bundle["models"][m], test,
                                  band_set=config.band_set, name=f"sub_te_{m}"))
     stacked_te = ensemble.to_common_grid(member_ens)
-    combined = ensemble.combine(stacked_te, model_bundle["weights"])
+    feat_te = _feat_ancil(test, config.band_set)
+    from conclave import recal as recal_mod
+    if config.recal in recal_mod.DEFICIT_RECALS:
+        ref = model_bundle.get("deficit_ref")
+        assert ref is not None, (
+            "deficit-conditioned recal needs 'deficit_ref' in the model bundle "
+            "(frozen labeled photometry, stored by train_submission_model since "
+            "the 2026-07 deficitbinned swap) — retrain the bundle")
+        feat_te["feat_deficit"] = _deficit_from_ref(ref, test, config.band_set)
+    combined = ensemble.combine(stacked_te, model_bundle["weights"], ancil=feat_te)
     out = model_bundle["recal"].apply(combined, apply_idx=np.arange(combined.npdf))
 
     # The submission must emit a valid, finite p(z) for EVERY object. Combining +
@@ -176,6 +262,9 @@ def infer(model_bundle, test_file):
     base["object_id"] = oid
     if "zmode" not in base:
         base["zmode"] = out.mode(grid=Z_GRID).squeeze()
+    # Free per-object reliability flag from member PDF spread (npdf aligned with the
+    # test set / object_id), so the deliverable carries a quality signal.
+    base["disagreement"] = ensemble.member_disagreement(stacked_te)
     out.set_ancil(base)
     return out
 
@@ -189,6 +278,22 @@ def run_taskset_1_training_and_estimation(train_file, test_file, output_file,
 
 def run_taskset_1_estimation_only(model_file, test_file, output_file,
                                   config=DEFAULT_CONFIG):
+    import pickle
+    with open(model_file, "rb") as fh:
+        bundle = pickle.load(fh)
+    ens = infer(bundle, test_file)
+    ens.write_to(output_file)
+
+
+def run_taskset_2_training_and_estimation(train_file, test_file, output_file,
+                                          config=TS2_CONFIG):
+    bundle = train_submission_model(train_file, config)
+    ens = infer(bundle, test_file)
+    ens.write_to(output_file)
+
+
+def run_taskset_2_estimation_only(model_file, test_file, output_file,
+                                  config=TS2_CONFIG):
     import pickle
     with open(model_file, "rb") as fh:
         bundle = pickle.load(fh)

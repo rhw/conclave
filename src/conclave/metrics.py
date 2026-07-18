@@ -136,6 +136,43 @@ def _pit_official(pit_vals):
     return {"CvM": cvm, "ksamp": ksamp, "PIT_outlier": pit_outlier}
 
 
+def score_arrays(zmode, z_true, pit=None, cde=None, official=False) -> dict:
+    """Metrics from per-object arrays — the post-hoc per-bin path.
+
+    Same formulas as ``score``/``_point``/``_pit_stats``, but consuming the
+    ``return_eval_arrays`` outputs of ``ts2.run_eval`` (``_zmode``/``_ztrue``/
+    ``_pit``/``_cde``) so one training per arm yields rows for any eval
+    sub-population (e.g. i-mag bins) without retraining. ``CDELoss`` here is the
+    mean of the per-object grid terms (int p_i^2 - 2 p_i(z_i)) with p_i(z_i)
+    interpolated EXACTLY; qp's ``CDELossMetric`` instead snaps z_i to the nearest
+    grid node, a ~5% offset whose sign depends on how the PDF grid aligns with the
+    eval grid — so compare CDE across arms with ONE estimator, never mixed
+    (2026-07-05 final review). With ``official=True`` and ``pit`` provided, the
+    returned dict additionally contains the scored PIT basket (``CvM``, ``ksamp``,
+    ``PIT_outlier`` via ``_pit_official``), previously available only through
+    ``score()``.
+    """
+    zmode = np.asarray(zmode, dtype=float)
+    z_true = np.asarray(z_true, dtype=float)
+    delta = (zmode - z_true) / (1.0 + z_true)
+    sigma_mad = 1.4826 * float(np.median(np.abs(delta - np.median(delta))))
+    out = {
+        "mean": float(np.median(delta)),
+        "std": sigma_mad,
+        "outlier": float(np.mean(np.abs(delta) > np.maximum(0.06, 3.0 * sigma_mad))),
+        "abs_outlier_rate": float(np.mean(np.abs(delta) > 0.15)),
+        "n_eval": int(len(z_true)),
+    }
+    if pit is not None:
+        p = np.clip(np.asarray(pit, dtype=float), 0.0, 1.0)
+        out.update(_pit_stats(p))
+        if official:
+            out.update(_pit_official(p))
+    if cde is not None:
+        out["CDELoss"] = float(np.mean(np.asarray(cde, dtype=float)))
+    return out
+
+
 def score(ensemble, z_true, z_grid=None) -> dict:
     """Compute all official TS1 scalar metrics.
 

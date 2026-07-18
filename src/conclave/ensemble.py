@@ -147,6 +147,42 @@ def optimal_weights(member_pdfs_calib, z_true_calib, z_grid=Z_GRID):
     return w / w.sum()
 
 
+def member_disagreement(stacked, grid=Z_GRID, full=False):
+    """Per-object disagreement among member PDFs — a free reliability flag.
+
+    ``stacked`` is the (K, npdf, ngrid) common-grid member-CDE array from
+    ``to_common_grid``.  Computed from members already built, so zero extra training.
+    Two interpretable components:
+
+      z_spread : std across the K members of each member's mean redshift
+                 E[z]_k = ∫ z p_k dz (smoother than the mode), in redshift units —
+                 the headline "members disagree by Δz".
+      tv       : mean pairwise total-variation distance 0.5 ∫|p_i − p_j| dz over the
+                 K(K−1)/2 member pairs, in [0, 1] — distributional, catches bimodal
+                 disagreement the mean-spread misses.
+
+    Returns the primary ``z_spread`` (npdf,) by default; with ``full=True`` returns
+    ``{"z_spread": ..., "tv": ...}``.  K=1 (no pairs) → zeros.  numpy only (RAIL-free).
+    """
+    grid = np.asarray(grid, dtype=float)
+    P = np.asarray(stacked, dtype=float)                       # (K, npdf, ngrid)
+    K, npdf, _ = P.shape
+    if K == 1:
+        z = np.zeros(npdf)
+        return {"z_spread": z, "tv": z.copy()} if full else z
+    zmean = _trapz(P * grid[None, None, :], grid, axis=-1)     # (K, npdf)
+    z_spread = zmean.std(axis=0)                               # population std over members
+    if not full:
+        return z_spread
+    tv_sum = np.zeros(npdf)
+    npairs = 0
+    for i in range(K):
+        for j in range(i + 1, K):
+            tv_sum += 0.5 * _trapz(np.abs(P[i] - P[j]), grid, axis=-1)
+            npairs += 1
+    return {"z_spread": z_spread, "tv": tv_sum / npairs}
+
+
 def member_corr_matrix(member_pdfs, z_true, z_grid=Z_GRID):
     """Pearson correlation matrix of per-member redshift residuals.
 

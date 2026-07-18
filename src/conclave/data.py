@@ -4,8 +4,8 @@ import numpy as np
 import tables_io
 
 
-def data_path(sim: str, label: str, scenario: str, public_dir: str) -> str:
-    return os.path.join(public_dir, f"pz_challenge_taskset_1_{sim}_{label}_{scenario}.hdf5")
+def data_path(sim: str, label: str, scenario: str, public_dir: str, taskset: int = 1) -> str:
+    return os.path.join(public_dir, f"pz_challenge_taskset_{taskset}_{sim}_{label}_{scenario}.hdf5")
 
 
 def load_catalog(path: str) -> dict[str, np.ndarray]:

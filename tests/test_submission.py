@@ -25,15 +25,41 @@ def _ens(n, loc0=0.5):
     return e
 
 
-def _install_stub_estimators(submission_mod, monkeypatch, n_train, n_test):
-    """Monkeypatch _load_catalog + ESTIMATORS so tests run without RAIL."""
-    rng = np.random.default_rng(1)
+def _install_stub_estimators(submission_mod, monkeypatch, n_train, n_test,
+                             test_has_redshift=True, test_mag_lo=20.0, test_mag_hi=24.0,
+                             test_color_shift=0.0):
+    """Monkeypatch _load_catalog + ESTIMATORS so tests run without RAIL.
+
+    test_has_redshift=False mimics the REAL blind test-file schema (no
+    ``redshift`` column) — the TS2 tests use it. test_mag_{lo,hi} set the test
+    i-mag range independently of training; set them fainter than the training
+    max to exercise the beyond-calib-support regime. All lsst_roman band
+    columns are present (mag_i + correlated noise) so deficit-conditioned
+    recals can build adjacent-band colors; test_color_shift displaces every
+    other test band by that amount, pushing test COLORS out of the labeled
+    support (positive label-free deficit)."""
+
+    _BANDS = ([f"mag_{b}_lsst" for b in "ugrizy"]
+              + ["mag_Y_roman", "mag_J_roman", "mag_H_roman"])
 
     def _fake_catalog(path):
-        n = n_test if "test" in path else n_train
-        return {"object_id": np.arange(n).astype(float),
-                "redshift": rng.uniform(0.1, 1.5, n),
-                "mag_i_lsst": rng.uniform(20, 24, n)}
+        is_test = "test" in path
+        n = n_test if is_test else n_train
+        rng = np.random.default_rng(1)          # per-call: same path -> same catalog
+        mlo, mhi = (test_mag_lo, test_mag_hi) if is_test else (20.0, 24.0)
+        cat = {"object_id": np.arange(n).astype(float),
+               "redshift": rng.uniform(0.1, 1.5, n),
+               "mag_i_lsst": rng.uniform(mlo, mhi, n)}
+        for c in _BANDS:
+            if c != "mag_i_lsst":
+                cat[c] = cat["mag_i_lsst"] + rng.normal(0.0, 0.3, n)
+        if is_test and test_color_shift:
+            for j, c in enumerate(_BANDS):
+                if j % 2 == 0:                  # every other band -> colors shift
+                    cat[c] = cat[c] + test_color_shift
+        if is_test and not test_has_redshift:
+            del cat["redshift"]
+        return cat
 
     def _pair(est_name):
         def _t(train_dict, band_set, seed, name):
@@ -220,3 +246,226 @@ def test_run_training_and_estimation_real_rail():
     grid = np.linspace(0, 3, 301)
     integ = np.trapezoid(np.asarray(e.pdf(grid)), grid, axis=1)
     assert np.median(integ) > 0.9
+
+
+# ---------------------------------------------------------------------------
+# TS2 tests: TS2_CONFIG + magbinned recal path (light, RAIL-free)
+# ---------------------------------------------------------------------------
+
+def test_ts2_config_values():
+    """TS2_CONFIG = the combination settled by the depth-matched rehearsal
+    (job 33575936): deficitbinned_pit, the pre-registered winner."""
+    c = submission.TS2_CONFIG
+    assert c.members == ["pzflow", "gpz", "flexzboost"]
+    assert c.band_set == "lsst_roman"
+    assert c.weights == "optimal"
+    assert c.recal == "deficitbinned_pit"
+
+
+# The pre-swap TS2 combination — kept as explicit regression coverage for the
+# magbinned submission path (class remains in the roster).
+_MAGBINNED_CFG = submission.Config(members=["pzflow", "gpz", "flexzboost"],
+                                   band_set="lsst_roman", weights="optimal",
+                                   recal="magbinned_pit")
+
+
+def test_ts2_train_infer_magbinned_no_test_redshift(monkeypatch):
+    """End-to-end TS2 path: magbinned recal fit (needs feat ancil on the calib
+    ensemble) + apply on a blind test file with NO redshift column. n_train=5000
+    -> calib 1000 -> 250/bin, above min_per_bin, so real per-bin remaps are
+    exercised (not just the pooled fallback). Would crash with
+    TypeError/KeyError before the feat-ancil plumbing."""
+    n_test = 60
+    _install_stub_estimators(submission, monkeypatch, n_train=5000, n_test=n_test,
+                             test_has_redshift=False)
+    bundle = submission.train_submission_model("train.hdf5", _MAGBINNED_CFG)
+    assert bundle["config"].recal == _MAGBINNED_CFG.recal
+    assert bundle["recal"]._edges is not None          # per-bin remaps really fit
+    out = submission.infer(bundle, "test_blind.hdf5")
+    assert out.npdf == n_test
+    grid = submission.Z_GRID
+    pdfs = np.asarray(out.pdf(grid))
+    assert np.isfinite(pdfs).all()
+    assert np.allclose(np.trapezoid(pdfs, grid, axis=1), 1.0, atol=1e-2)
+    assert np.array_equal(np.asarray(out.ancil["object_id"]), np.arange(n_test))
+    assert "zmode" in out.ancil
+
+
+def test_ts2_infer_beyond_calib_support_faintest_bin(monkeypatch):
+    """The 63%-of-test deployment regime: test objects FAINTER than every calib
+    object (i in [25,26], calib maxes ~24) must digitize into the magbinned recal's
+    faintest bin and yield finite, normalized PDFs — never NaN or an out-of-range
+    error (docstring's 'by design'). Verified with the review's F2 case."""
+    n_test = 50
+    _install_stub_estimators(submission, monkeypatch, n_train=5000, n_test=n_test,
+                             test_has_redshift=False, test_mag_lo=25.0, test_mag_hi=26.0)
+    bundle = submission.train_submission_model("train.hdf5", _MAGBINNED_CFG)
+    top_edge = float(bundle["recal"]._edges[-1])
+    assert top_edge < 25.0                     # all test objects are beyond the top edge
+    out = submission.infer(bundle, "test_blind.hdf5")
+    pdfs = np.asarray(out.pdf(submission.Z_GRID))
+    assert out.npdf == n_test
+    assert np.isfinite(pdfs).all()
+    assert np.allclose(np.trapezoid(pdfs, submission.Z_GRID, axis=1), 1.0, atol=1e-2)
+
+
+def test_ts2_estimation_only_pickle_roundtrip(tmp_path, monkeypatch):
+    """run_taskset_2_estimation_only: pickled bundle -> qp file, blind schema."""
+    import pickle
+    _install_stub_estimators(submission, monkeypatch, n_train=5000, n_test=40,
+                             test_has_redshift=False)
+    bundle = submission.train_submission_model("train.hdf5", _MAGBINNED_CFG)
+    mf = tmp_path / "bundle.pkl"
+    with open(mf, "wb") as fh:
+        pickle.dump(bundle, fh)
+    of = tmp_path / "pz_ts2.hdf5"
+    submission.run_taskset_2_estimation_only(str(mf), "test_blind.hdf5", str(of))
+    back = qp.read(str(of))
+    assert back.npdf == 40
+
+
+def test_ts2_run_training_and_estimation_writes_readable_qp(tmp_path, monkeypatch):
+    _install_stub_estimators(submission, monkeypatch, n_train=5000, n_test=40,
+                             test_has_redshift=False)
+    of = tmp_path / "pz_ts2.hdf5"
+    submission.run_taskset_2_training_and_estimation("train.hdf5", "test_blind.hdf5",
+                                                     str(of), config=_MAGBINNED_CFG)
+    back = qp.read(str(of))
+    assert back.npdf == 40
+    assert np.isfinite(np.asarray(back.pdf(submission.Z_GRID))).all()
+
+
+def test_ts1_global_pit_ignores_feat_ancil(monkeypatch):
+    """Regression: the new feat ancil is inert for the TS1 global_pit path — the
+    trained bundle's recal remap and inferred PDFs are unchanged by its presence."""
+    _install_stub_estimators(submission, monkeypatch, n_train=400, n_test=30)
+    bundle = submission.train_submission_model("train.hdf5", submission.DEFAULT_CONFIG)
+    out = submission.infer(bundle, "test.hdf5")
+    monkeypatch.setattr(submission, "_feat_ancil", lambda cat, band_set: {})
+    bundle2 = submission.train_submission_model("train.hdf5", submission.DEFAULT_CONFIG)
+    out2 = submission.infer(bundle2, "test.hdf5")
+    np.testing.assert_allclose(np.asarray(out.pdf(submission.Z_GRID)),
+                               np.asarray(out2.pdf(submission.Z_GRID)), atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# TS2 deficitbinned tests (recal swap, rehearsal job 33575936)
+# ---------------------------------------------------------------------------
+
+def test_ts2_train_infer_deficitbinned_no_test_redshift(monkeypatch):
+    """End-to-end TS2 path with the deficit-conditioned recal: the bundle must
+    carry a frozen deficit_ref (train-slice band photometry) and infer must
+    compute feat_deficit for the blind test file (NO redshift column) from it,
+    yielding finite normalized PDFs. Would crash with KeyError('feat_deficit')
+    before the plumbing."""
+    n_test = 60
+    _install_stub_estimators(submission, monkeypatch, n_train=5000, n_test=n_test,
+                             test_has_redshift=False)
+    bundle = submission.train_submission_model("train.hdf5", submission.TS2_CONFIG)
+    assert bundle["config"].recal == "deficitbinned_pit"
+    ref = bundle["deficit_ref"]
+    assert ref is not None
+    from conclave import bands
+    assert set(ref) == set(bands.band_columns("lsst_roman"))
+    assert len(ref["mag_i_lsst"]) == 4000          # train slice = 80% of 5000
+    assert bundle["recal"]._edges is not None      # deficit bins really fit
+    out = submission.infer(bundle, "test_blind.hdf5")
+    assert out.npdf == n_test
+    grid = submission.Z_GRID
+    pdfs = np.asarray(out.pdf(grid))
+    assert np.isfinite(pdfs).all()
+    assert np.allclose(np.trapezoid(pdfs, grid, axis=1), 1.0, atol=1e-2)
+    assert np.array_equal(np.asarray(out.ancil["object_id"]), np.arange(n_test))
+    assert "zmode" in out.ancil
+
+
+def test_ts2_infer_out_of_support_positive_deficit(monkeypatch):
+    """The deployment regime the rehearsal measured: test objects whose COLORS
+    sit outside the labeled support must get a strictly positive label-free
+    deficit from the frozen reference (routing them to the positive-tail bins)
+    and still yield finite, normalized PDFs."""
+    n_test = 50
+    _install_stub_estimators(submission, monkeypatch, n_train=5000, n_test=n_test,
+                             test_has_redshift=False, test_color_shift=3.0)
+    bundle = submission.train_submission_model("train.hdf5", submission.TS2_CONFIG)
+    test_cat = submission._load_catalog("test_blind.hdf5")
+    d = submission._deficit_from_ref(bundle["deficit_ref"], test_cat, "lsst_roman")
+    assert d.shape == (n_test,)
+    assert (d > 0).all()                           # far out of color support
+    out = submission.infer(bundle, "test_blind.hdf5")
+    pdfs = np.asarray(out.pdf(submission.Z_GRID))
+    assert out.npdf == n_test
+    assert np.isfinite(pdfs).all()
+    assert np.allclose(np.trapezoid(pdfs, submission.Z_GRID, axis=1), 1.0, atol=1e-2)
+
+
+def test_deficit_from_ref_matches_direct_label_free_deficit(monkeypatch):
+    """Consistency guarantee: the merged-catalog helper must reproduce
+    challenge.label_free_deficit called directly on a full catalog with the
+    same labeled/target index sets (identical standardization, imputation,
+    d_ref)."""
+    from conclave import challenge
+    rng = np.random.default_rng(7)
+    n = 300
+    cols = ([f"mag_{b}_lsst" for b in "ugrizy"]
+            + ["mag_Y_roman", "mag_J_roman", "mag_H_roman"])
+    base = rng.uniform(20, 24, n)
+    cat = {c: base + rng.normal(0, 0.3, n) for c in cols}
+    cat["mag_i_lsst"] = base
+    labeled = np.arange(0, 200)
+    target = np.arange(200, 300)
+    direct = challenge.label_free_deficit(cat, labeled, target,
+                                          band_set="lsst_roman")
+    ref = {c: np.asarray(cat[c], float)[labeled] for c in cols}
+    tgt = {c: np.asarray(cat[c], float)[target] for c in cols}
+    via_ref = submission._deficit_from_ref(ref, tgt, "lsst_roman")
+    np.testing.assert_allclose(via_ref, direct, atol=1e-12)
+
+
+def test_ts2_infer_missing_deficit_ref_fails_clearly(monkeypatch):
+    """An OLD bundle (pre-swap, no deficit_ref) used with a deficit recal must
+    fail with a message naming deficit_ref — not a deep KeyError inside the
+    recalibrator."""
+    _install_stub_estimators(submission, monkeypatch, n_train=5000, n_test=20,
+                             test_has_redshift=False)
+    bundle = submission.train_submission_model("train.hdf5", submission.TS2_CONFIG)
+    bundle.pop("deficit_ref")
+    with pytest.raises(AssertionError, match="deficit_ref"):
+        submission.infer(bundle, "test_blind.hdf5")
+
+
+def test_ts2_deficitbinned_pickle_roundtrip(tmp_path, monkeypatch):
+    """run_taskset_2_estimation_only with the NEW config: pickled bundle
+    (including deficit_ref arrays) -> qp file, blind schema."""
+    import pickle
+    from conclave import bands
+    _install_stub_estimators(submission, monkeypatch, n_train=5000, n_test=40,
+                             test_has_redshift=False)
+    bundle = submission.train_submission_model("train.hdf5", submission.TS2_CONFIG)
+    mf = tmp_path / "bundle.pkl"
+    with open(mf, "wb") as fh:
+        pickle.dump(bundle, fh)
+
+    # Verify deficit-specific plumbing survived the pickle roundtrip
+    with open(mf, "rb") as fh:
+        loaded = pickle.load(fh)
+    assert loaded["config"].recal == "deficitbinned_pit"
+    assert type(loaded["recal"]).__name__ == "DeficitBinnedPITRecalibrator"
+    assert loaded["deficit_ref"] is not None
+    assert set(loaded["deficit_ref"]) == set(bands.band_columns("lsst_roman"))
+    for col in bands.band_columns("lsst_roman"):
+        np.testing.assert_allclose(loaded["deficit_ref"][col], bundle["deficit_ref"][col])
+
+    of = tmp_path / "pz_ts2.hdf5"
+    submission.run_taskset_2_estimation_only(str(mf), "test_blind.hdf5", str(of))
+    back = qp.read(str(of))
+    assert back.npdf == 40
+    assert np.isfinite(np.asarray(back.pdf(submission.Z_GRID))).all()
+
+
+def test_ts1_bundle_has_no_deficit_ref_payload(monkeypatch):
+    """Non-deficit recals must not pay the deficit_ref memory cost: the key is
+    present (uniform schema) but None for TS1's global_pit."""
+    _install_stub_estimators(submission, monkeypatch, n_train=400, n_test=30)
+    bundle = submission.train_submission_model("train.hdf5", submission.DEFAULT_CONFIG)
+    assert bundle["deficit_ref"] is None

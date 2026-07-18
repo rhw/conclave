@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conclave"
-version = "0.0.1"
-description = "conclave — LSST-DESC PZ Data Challenge TS1 ensemble (PZFlow+GPz+FlexZBoost, convex-QP weights, global-PIT)"
+version = "0.0.2"
+description = "conclave — LSST-DESC PZ Data Challenge TS1+TS2 ensemble (PZFlow+GPz+FlexZBoost, convex-QP weights; TS1 global-PIT, TS2 deficit-binned PIT)"
 requires-python = ">=3.13"
 dependencies = ["numpy", "scipy", "pandas", "pyarrow", "tables_io", "qp-prob",
-                "pz-rail-base", "pz-rail-flexzboost", "pz-rail-pzflow", "pz-rail-gpz-v1"]
+                "pz-rail-base", "pz-rail-flexzboost", "pz-rail-pzflow", "pz-rail-gpz-v1",
+                "scikit-learn", "h5py"]
 
 [project.optional-dependencies]
 dev = ["pytest"]

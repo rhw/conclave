@@ -12,3 +12,10 @@ def test_band_columns():
 
 def test_apply_band_set_returns_tag():
     assert bands.apply_band_set("lsst_roman") == "pzdc_lsst_roman"
+
+def test_hsc_grizy_band_set():
+    from conclave import bands
+    assert bands.band_columns("hsc_grizy") == [
+        "mag_g_lsst", "mag_r_lsst", "mag_i_lsst", "mag_z_lsst", "mag_y_lsst"]
+    assert bands.BAND_SETS["hsc_grizy"] == "pzdc_hsc_grizy"       # tag for apply_band_set
+    assert "mag_u_lsst" not in bands.band_columns("hsc_grizy")     # no u

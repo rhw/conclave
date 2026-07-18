@@ -2,9 +2,10 @@
 import os
 from rail.utils import catalog_utils
 
-BAND_SETS = {"lsst": "pzdc_lsst", "lsst_roman": "pzdc_lsst_roman"}
+BAND_SETS = {"lsst": "pzdc_lsst", "lsst_roman": "pzdc_lsst_roman", "hsc_grizy": "pzdc_hsc_grizy"}
 _LSST = [f"mag_{b}_lsst" for b in "ugrizy"]
 _ROMAN = ["mag_Y_roman", "mag_J_roman", "mag_H_roman"]
+_HSC_GRIZY = [f"mag_{b}_lsst" for b in "grizy"]
 
 # 5-sigma limiting magnitudes per band column (mirror of data/catalogs_pzdc.yaml).
 # Used to impute non-detections (NaN magnitudes) for estimators that bypass RAIL's
@@ -28,6 +29,8 @@ def band_columns(band_set: str) -> list[str]:
         return list(_LSST)
     if band_set == "lsst_roman":
         return _LSST + _ROMAN
+    if band_set == "hsc_grizy":
+        return list(_HSC_GRIZY)
     raise KeyError(band_set)
 
 

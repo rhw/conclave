@@ -115,6 +115,11 @@ class MagBinnedPITRecalibrator:
         ys = np.linspace(0.0, 1.0, len(xs))
         return interp1d(xs, ys, bounds_error=False, fill_value=(0.0, 1.0))
 
+    def _bin_edges(self, feat, finite):
+        """Inner bin edges (length n_bins-1): plain quantiles of the finite feature."""
+        qs = np.linspace(0.0, 1.0, self.n_bins + 1)[1:-1]   # inner edges
+        return (np.quantile(feat[finite], qs) if finite.any() else np.array([]))
+
     def fit(self, ensemble, z_true, fit_idx) -> None:
         fit_idx = np.asarray(fit_idx)
         self._fit_idx = set(fit_idx.tolist())
@@ -126,10 +131,9 @@ class MagBinnedPITRecalibrator:
         # Pooled global remap (used as fallback for NaN-feature / sparse bins).
         self._F_global = self._fit_pit_cdf(pit)
 
-        # Quantile bin edges on finite features only.
-        qs = np.linspace(0.0, 1.0, self.n_bins + 1)[1:-1]   # inner edges
-        self._edges = (np.quantile(feat[finite], qs) if finite.any()
-                       else np.array([]))
+        # Quantile bin edges on finite features only (overridable — see
+        # DeficitBinnedPITRecalibrator for the zero-inflated variant).
+        self._edges = self._bin_edges(feat, finite)
         binid = np.digitize(feat, self._edges)              # 0..n_bins-1 for finite
         self._F_bins = []
         for b in range(self.n_bins):
@@ -161,6 +165,45 @@ class MagBinnedPITRecalibrator:
         pdf_new = np.clip(np.diff(cdf_new, axis=1) / dz, 0.0, None)
         x_mid = 0.5 * (y_grid[:-1] + y_grid[1:])
         return qp.Ensemble(qp.interp, data={"xvals": x_mid, "yvals": pdf_new})
+
+
+class DeficitBinnedPITRecalibrator(MagBinnedPITRecalibrator):
+    """Support-deficit-binned global-PIT: ``MagBinnedPITRecalibrator`` pointed at a
+    ``feat_deficit`` ancil (the label-free color-space kNN support deficit from
+    ``challenge.label_free_deficit``) instead of i-band magnitude. Motivation: objects
+    far from the training support are miscalibrated in ways i-mag alone doesn't capture,
+    so a deficit-conditioned PIT remap can fix calibration exactly where support runs out.
+
+    Zero-inflated binning (the only new logic): the deficit is ``max(0, d/d_ref - 1)``,
+    so all in-support objects sit *exactly* at 0 — plain quantile edges over the feature
+    degenerate (many identical 0 edges) and collapse the bins. Instead:
+      * bin 0  = the zero-deficit population (``feat <= eps``, i.e. in-support objects);
+      * bins 1..n_bins-1 = the strictly-positive tail, quantile-binned as usual.
+    The first inner edge is ``eps`` (separating zeros from positives), followed by the
+    ``n_bins-2`` quantile edges of the positive tail. Everything else — the per-bin
+    empirical-PIT-CDF remap, the ``min_per_bin`` fallback to the pooled global remap, and
+    the NaN-feature fallback — is inherited unchanged from the parent.
+
+    Degeneracies (all handled by the inherited machinery):
+      * all-zero deficit -> no positive tail -> empty edges -> a single bin over all
+        objects, which is exactly the pooled global remap;
+      * NaN deficit -> excluded from the edges (``finite`` mask) and routed to the pooled
+        global fallback at apply, same as the parent's NaN handling.
+    """
+
+    def __init__(self, feature_key="feat_deficit", n_bins=4, min_per_bin=200,
+                 y_grid=None, eps=1e-9):
+        super().__init__(feature_key=feature_key, n_bins=n_bins,
+                         min_per_bin=min_per_bin, y_grid=y_grid)
+        self.eps = float(eps)
+
+    def _bin_edges(self, feat, finite):
+        # bin 0 = zero-deficit (<= eps); positive tail quantile-binned into n_bins-1 bins.
+        pos = finite & (feat > self.eps)
+        if not pos.any():                       # all-zero / all-NaN -> single bin == global
+            return np.array([])
+        qs = np.linspace(0.0, 1.0, self.n_bins)[1:-1]   # n_bins-2 edges for the positive tail
+        return np.concatenate([[self.eps], np.quantile(feat[pos], qs)])
 
 
 class CalPITRecalibrator:
@@ -317,5 +360,10 @@ RECALIBRATORS = {
     "none": IdentityRecalibrator,
     "global_pit": GlobalPITRecalibrator,
     "magbinned_pit": MagBinnedPITRecalibrator,
+    "deficitbinned_pit": DeficitBinnedPITRecalibrator,
     "calpit": CalPITRecalibrator,
 }
+
+# Recalibrators that condition on the label-free support deficit — ts2.run_eval must
+# attach a ``feat_deficit`` ancil only for these (the default path stays deficit-free).
+DEFICIT_RECALS = {"deficitbinned_pit"}
