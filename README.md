@@ -58,3 +58,7 @@ LSST-DESC PZ Data Challenge: <https://pz-data-challenge.readthedocs.io> ·
 ## License
 
 BSD 3-Clause — see [LICENSE](LICENSE).
+
+## Point estimate (revision 2026-07-21)
+
+The delivered `ancil["zmode"]` is the mode of p(z)·r(z), where r(z) = clip(N̂_test/N_train, 1/3, 3): N_train is the Gaussian-smoothed (σ_z = 0.075) redshift distribution of the training spectroscopy, and N̂_test is the same-smoothed mean of this submission's own test-set PDFs, computed per test file. Two notes on methodology: (1) this estimator is **transductive** — the test set is used in aggregate, label-free, to estimate the N(z) prior correction applied to its own point estimates; (2) the correction's functional form and candidate were pre-registered and selected on an external spectroscopic validation sample (DESI+COSMOS, reweighted to the test i-magnitude mix) with no challenge labels used, while the two hyperparameters (σ_z, rmax) were subsequently chosen from a 5×5 sensitivity sweep on that same validation sample — i.e., post-hoc within our own validation data. The p(z) ensembles, PDFs, and all PIT/CDE-relevant deliverables are byte-identical to the original submission; only the per-object point-estimate scalar changed. Implementation: `conclave.pointest.prior_shift_mode` via `conclave.submission.priorshift_zmode`.

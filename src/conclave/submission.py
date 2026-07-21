@@ -48,6 +48,9 @@ from conclave import ensemble
 
 Z_GRID = ensemble.Z_GRID
 
+PRIORSHIFT_SIGMA_Z = 0.075   # PI-approved 2026-07-21 (sweep plateau, post-hoc — disclosed)
+PRIORSHIFT_RMAX = 3.0
+
 
 @dataclass
 class Config:
@@ -55,6 +58,7 @@ class Config:
     band_set: str = "lsst_roman"
     weights: str = "optimal"           # "equal" or "optimal" (convex-QP)
     recal: str = "global_pit"
+    pointest: str = "mode"             # "mode" | "priorshift" (C3, TS2 revision 2026-07)
 
 
 # The winning combination (Phase-3 ensemble experiment).
@@ -68,10 +72,23 @@ DEFAULT_CONFIG = Config(members=["pzflow", "gpz", "flexzboost"],
 # deficitbinned_pit beats the previously packaged magbinned_pit in 36/36
 # paired per-seed deployment-condition comparisons and wins 5/7 scored
 # metrics vs global_pit on both blind-test i-mag mixes (pre-registered rule).
+# pointest="priorshift": the delivered zmode is the C3 empirical-Bayes
+# prior-shift mode (conclave.pointest.prior_shift_mode), settled by the
+# 2026-07-21 point-estimate bake-off (docs/journal/2026-07-21-*).
 TS2_CONFIG = Config(members=["pzflow", "gpz", "flexzboost"],
                     band_set="lsst_roman",
                     weights="optimal",
-                    recal="deficitbinned_pit")
+                    recal="deficitbinned_pit",
+                    pointest="priorshift")
+
+
+def priorshift_zmode(pdf, grid, ztrain):
+    """Deployment C3: prior-shift mode with UNIFORM weights (the blind test file
+    is the exact target mix; N_hat_test is the plain mean of its delivered PDFs)."""
+    from conclave import pointest
+    w = np.ones(np.atleast_2d(pdf).shape[0])
+    return pointest.prior_shift_mode(pdf, grid, ztrain, w,
+                                     sigma_z=PRIORSHIFT_SIGMA_Z, rmax=PRIORSHIFT_RMAX)
 
 
 def _feat_ancil(cat, band_set):
@@ -216,8 +233,15 @@ def train_submission_model(train_file, config=DEFAULT_CONFIG):
     # Clear the leakage guard: the test ensemble is a different object/rows.
     r._fit_idx = set()
 
+    # Frozen full-training-file redshift column (train UNION calib) for the
+    # C3 prior-shift point estimate (pointest="priorshift"). Stored
+    # unconditionally (100k float64 ~= 0.8 MB against a 59 MB bundle) so an
+    # existing bundle can be upgraded to priorshift deployment without a
+    # retrain.
+    ztrain = np.asarray(full["redshift"], dtype=float)
+
     return {"models": models, "weights": w, "recal": r, "config": config,
-            "deficit_ref": deficit_ref}
+            "deficit_ref": deficit_ref, "ztrain": ztrain}
 
 
 def infer(model_bundle, test_file):
@@ -260,7 +284,14 @@ def infer(model_bundle, test_file):
     # ensure zmode is present for point metrics / downstream.
     base = dict(out.ancil) if out.ancil else {}
     base["object_id"] = oid
-    if "zmode" not in base:
+    if getattr(config, "pointest", "mode") == "priorshift":
+        ztrain = model_bundle.get("ztrain")
+        assert ztrain is not None, (
+            "pointest='priorshift' needs 'ztrain' in the model bundle (frozen "
+            "training spec-z, stored by train_submission_model since the 2026-07 "
+            "C3 revision) — retrain or upgrade the bundle")
+        base["zmode"] = priorshift_zmode(np.asarray(out.pdf(Z_GRID)), Z_GRID, ztrain)
+    elif "zmode" not in base:
         base["zmode"] = out.mode(grid=Z_GRID).squeeze()
     # Free per-object reliability flag from member PDF spread (npdf aligned with the
     # test set / object_id), so the deliverable carries a quality signal.
